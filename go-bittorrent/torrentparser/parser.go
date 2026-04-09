@@ -7,71 +7,92 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/jackpal/bencode-go"
 )
 
 const BLOCK_LENGTH = 16384 // 2^14 bytes
-//Pieces are split into 16KB blocks for requests.
 
 // represents a .torrent file
 type TorrentFile struct {
-	Announce string      `bencode:"announce"` // Tracker URL (where to find peers)
-	Info     TorrentInfo `bencode:"info"`     // Info Dictionary The actual torrent metadata
+	Announce     string      `bencode:"announce"`      // Tracker URL
+	AnnounceList [][]string  `bencode:"announce-list"`  // Multiple tracker URLs
+	Info         TorrentInfo `bencode:"info"`           // Info Dictionary
+	RawInfoHash  [20]byte   // SHA-1 of the raw info dictionary bytes
 }
 
 type TorrentInfo struct {
-	Name        string     // Name of the file/folder
-	PieceLength int64      // Size of each piece (e.g., 262144 bytes = 256KB)
-	Pieces      string     // Binary string: 20-byte SHA-1 hash for each piece
-	Length      int64      // Single file size (if single-file torrent)
-	Files       []FileInfo // Multiple files (if multi-file torrent)
+	Name        string     `bencode:"name"`         // Name of the file/folder
+	PieceLength int64      `bencode:"piece length"` // Size of each piece
+	Pieces      string     `bencode:"pieces"`       // Binary string of SHA-1 hashes
+	Length      int64      `bencode:"length"`       // Single file size
+	Files       []FileInfo `bencode:"files"`        // Multiple files (if multi-file torrent)
 }
 
-//Pieces is a concatenated string of 20-byte hashes. If there are 100 pieces, it's 2000 bytes (100 × 20).
-
-// Represents one file in a multi-file torrent.
 type FileInfo struct {
-	Length int64    // File size
-	Path   []string // File path (e.g., ["folder", "file.pdf"])
+	Length int64    `bencode:"length"` // File size
+	Path   []string `bencode:"path"`  // File path components
 }
 
 // Open reads and parses a torrent file
-/*
-Unmarshal -> convert data from a file format (like JSON, bencode, XML)
-             into Go structs/objects.
-
-*/
-func Open(filePath string) (*TorrentFile, error) { // takes a file path and returns a ptr to
-	// TorrentFile
+func Open(filePath string) (*TorrentFile, error) {
 	fmt.Println("====== opening the torrent file ======")
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err // return nil and error on failing to open
-	}
-	defer file.Close() //Defer is used to ensure that a function call is performed later \
-	// in a program’s  execution, usually for purposes of cleanup.
-	//file object will be automatically called just before the enclosing function returns,
-	// regardless of how the function exits
 
-	torrent := &TorrentFile{}
-	err = bencode.Unmarshal(file, torrent) //reads the bencoded file and fills the torrent struct
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Print torrent info without the binary pieces field
+	torrent := &TorrentFile{}
+	err = bencode.Unmarshal(bytes.NewReader(data), torrent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse torrent file: %v", err)
+	}
+
+	// Calculate info hash from the raw info dictionary bytes
+	// We must hash the original bytes, not re-encoded ones
+	var rawTorrent map[string]interface{}
+	err = bencode.Unmarshal(bytes.NewReader(data), &rawTorrent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse raw torrent: %v", err)
+	}
+
+	infoDict, ok := rawTorrent["info"]
+	if !ok {
+		return nil, fmt.Errorf("torrent file missing info dictionary")
+	}
+
+	// Re-encode just the info dict from the raw parsed map
+	// This preserves the original field ordering and values
+	var infoBuf bytes.Buffer
+	err = bencode.Marshal(&infoBuf, infoDict)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode info dict: %v", err)
+	}
+
+	torrent.RawInfoHash = sha1.Sum(infoBuf.Bytes())
+
+	// Print torrent info
 	fmt.Printf("Torrent Name: %s\n", torrent.Info.Name)
 	fmt.Printf("Announce URL: %s\n", torrent.Announce)
 	fmt.Printf("Piece Length: %d bytes\n", torrent.Info.PieceLength)
 	fmt.Printf("Number of Pieces: %d\n", len(torrent.Info.Pieces)/20)
+	fmt.Printf("Info Hash: %x\n", torrent.RawInfoHash)
 
-	// Handling single vs multi file info printing
+	if len(torrent.AnnounceList) > 0 {
+		fmt.Printf("Tracker tiers: %d\n", len(torrent.AnnounceList))
+	}
+
 	if len(torrent.Info.Files) > 0 {
 		fmt.Printf("Files: %d\n", len(torrent.Info.Files))
+		var totalSize int64
 		for i, file := range torrent.Info.Files {
-			fmt.Printf("  File %d: %s (%d bytes)\n", i+1, file.Path[0], file.Length)
+			path := filepath.Join(file.Path...)
+			fmt.Printf("  File %d: %s (%d bytes)\n", i+1, path, file.Length)
+			totalSize += file.Length
 		}
+		fmt.Printf("Total Size: %d bytes\n", totalSize)
 	} else {
 		fmt.Printf("File Size: %d bytes\n", torrent.Info.Length)
 	}
@@ -79,52 +100,55 @@ func Open(filePath string) (*TorrentFile, error) { // takes a file path and retu
 	return torrent, nil
 }
 
-// Size calculates the total size of all files in the torrent
-// Tells tracker how much you have left to download
-func Size(torrent *TorrentFile) []byte {
-	var size int64 // to hold very large numbers
+// TotalLength returns the total size of all files in the torrent
+func TotalLength(torrent *TorrentFile) int64 {
 	if len(torrent.Info.Files) > 0 {
+		var size int64
 		for _, file := range torrent.Info.Files {
 			size += file.Length
 		}
-	} else {
-		size = torrent.Info.Length
+		return size
 	}
+	return torrent.Info.Length
+}
 
-	buf := make([]byte, 8)                        // create a byte slice of 8 bytes
-	binary.BigEndian.PutUint64(buf, uint64(size)) //Converts the size to bytes in big-endian order
+// Size returns total size as 8-byte big-endian (for tracker protocol)
+func Size(torrent *TorrentFile) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(TotalLength(torrent)))
 	return buf
 }
 
-// InfoHash calculates the SHA-1 hash of the info dictionary
-// Used in tracker requests to identify which torrent you want
-// Used in peer handshakes to verify you're downloading the same torrent
-// Must match exactly - any change to the info dict changes the hash
+// InfoHash returns the precomputed SHA-1 hash of the info dictionary
 func InfoHash(torrent *TorrentFile) ([]byte, error) {
-	// Re-encode just the info dictionary
-	var buf bytes.Buffer
-	err := bencode.Marshal(&buf, torrent.Info) //Marshals torrent.Info back into bencode format
-	if err != nil {
-		return nil, err
-	}
+	hash := torrent.RawInfoHash
+	return hash[:], nil
+}
 
-	hash := sha1.Sum(buf.Bytes())
-	//sha1.Sum() returns a fixed-size array [20]byte
-	return hash[:], nil //hash[:] converts the array to a slice
+// TotalPieces returns the number of pieces in the torrent
+func TotalPieces(torrent *TorrentFile) int {
+	return len(torrent.Info.Pieces) / 20
+}
+
+// PieceHash returns the expected SHA-1 hash for a given piece index
+func PieceHash(torrent *TorrentFile, pieceIndex int) []byte {
+	start := pieceIndex * 20
+	end := start + 20
+	if end > len(torrent.Info.Pieces) {
+		return nil
+	}
+	return []byte(torrent.Info.Pieces[start:end])
 }
 
 // PieceLen returns the length of a piece at the given index
 func PieceLen(torrent *TorrentFile, pieceIndex int) int64 {
-	totalLength := binary.BigEndian.Uint64(Size(torrent))
-	//Converts from the 8-byte format back to a number
+	totalLength := TotalLength(torrent)
+	pieceLength := torrent.Info.PieceLength
 
-	pieceLength := torrent.Info.PieceLength //Gets the standard piece size
-	// (e.g., 262144 bytes = 256KB)
+	lastPieceIndex := int(totalLength / pieceLength)
+	lastPieceLength := totalLength % pieceLength
 
-	lastPieceLength := int64(totalLength) % pieceLength
-	lastPieceIndex := int64(totalLength) / pieceLength
-
-	if int64(pieceIndex) == lastPieceIndex {
+	if pieceIndex == lastPieceIndex && lastPieceLength != 0 {
 		return lastPieceLength
 	}
 	return pieceLength
@@ -148,7 +172,29 @@ func BlockLen(torrent *TorrentFile, pieceIndex int, blockIndex int) int {
 	return BLOCK_LENGTH
 }
 
-// Helper function to read torrent file for info hash calculation
+// GetTrackerURLs returns all tracker URLs (announce + announce-list), deduplicated
+func GetTrackerURLs(torrent *TorrentFile) []string {
+	seen := map[string]bool{}
+	var urls []string
+
+	if torrent.Announce != "" {
+		urls = append(urls, torrent.Announce)
+		seen[torrent.Announce] = true
+	}
+
+	for _, tier := range torrent.AnnounceList {
+		for _, u := range tier {
+			if !seen[u] && u != "" {
+				urls = append(urls, u)
+				seen[u] = true
+			}
+		}
+	}
+
+	return urls
+}
+
+// Helper function to read torrent file for info hash calculation (unused, kept for reference)
 func readTorrentFile(filePath string) (map[string]interface{}, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
