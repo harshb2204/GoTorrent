@@ -82,17 +82,36 @@ func Download(torrent *torrentparser.TorrentFile, downloadPath string) error {
 		buffers: make(map[int][]byte),
 	}
 
-	// Download from all peers concurrently
-	var wg sync.WaitGroup
-	for _, peer := range peers {
-		wg.Add(1)
-		go func(p tracker.Peer) {
-			defer wg.Done()
-			downloadFromPeer(p, torrent, piecesTracker, file, pieceBuffers)
-		}(peer)
-	}
+	// Retry loop: re-contact tracker if download is incomplete
+	maxRetries := 5
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			fmt.Printf("\nRetry %d/%d — re-contacting tracker for remaining pieces...\n", attempt, maxRetries)
+			peers, err = tracker.GetPeers(torrent)
+			if err != nil {
+				fmt.Printf("Failed to get peers on retry: %v\n", err)
+				continue
+			}
+			fmt.Printf("Found %d peers\n", len(peers))
+		}
 
-	wg.Wait()
+		var wg sync.WaitGroup
+		for _, peer := range peers {
+			wg.Add(1)
+			go func(p tracker.Peer) {
+				defer wg.Done()
+				downloadFromPeer(p, torrent, piecesTracker, file, pieceBuffers)
+			}(peer)
+		}
+
+		wg.Wait()
+
+		if piecesTracker.IsDone() {
+			break
+		}
+
+		fmt.Printf("\nProgress: %.2f%% — some pieces still missing\n", piecesTracker.GetProgress())
+	}
 
 	if piecesTracker.IsDone() {
 		fmt.Println("\n\n********** DOWNLOAD COMPLETE **********")
