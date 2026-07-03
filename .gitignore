@@ -1,0 +1,27 @@
+# Binaries
+*.exe
+*.out
+*.bin
+
+# Go build artifacts
+go-bittorrent/bittorrent-client.exe
+
+# Torrent downloaded content
+go-bittorrent/Big Buck Bunny/
+go-bittorrent/Electronics. Explained Simply and Easily 2024/
+go-bittorrent/sample.txt/
+
+# Temporary download files
+*.tmp
+
+# Torrent files (optional: remove if you want to track these)
+*.torrent
+
+# Go dependency cache
+vendor/
+
+# IDE / OS files
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
